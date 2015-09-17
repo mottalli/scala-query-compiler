@@ -1,45 +1,68 @@
-trait Constraint
+sealed trait Constraint extends Value {
+  def or(rhs: Constraint) = OrConstraint(this, rhs)
+  def and(rhs: Constraint) = AndConstraint(this, rhs)
+}
 case class GreaterThanConstraint(lhs: Value, rhs: Value) extends Constraint
+case class SmallerThanConstraint(lhs: Value, rhs: Value) extends Constraint
+case class NotConstraint(what: Constraint) extends Constraint
+case class AndConstraint(lhs: Constraint, rhs: Constraint) extends Constraint
+case class OrConstraint(lhs: Constraint, rhs: Constraint) extends Constraint
+case class InConstraint(what: Value, in: QueryNode) extends Constraint
 
-trait Value {
+sealed trait Value {
   def >(other: Value) = GreaterThanConstraint(this, other)
+  def <(other: Value) = SmallerThanConstraint(this, other)
   def sum = SumAggregation(this)
   def as(alias: String) = AliasedValue(this, alias)
 }
 
-case class SumAggregation(value: Value) extends Value
+sealed trait AggregatedValue extends Value {
+}
+
+case class SumAggregation(value: Value) extends AggregatedValue
 case class AliasedValue(value: Value, alias: String) extends Value
+case class ColumnValue(column: Column) extends Value
 
-class Column
+case class NullValue() extends Value
+case class ConstantValue[T <: AnyVal](constant: T) extends Value
+object Implicits {
+  implicit def constantToVal[T <: AnyVal](v: T): ConstantValue[T] = ConstantValue(v)
+}
+import Implicits.constantToVal
 
-case class ColumnValue(column: String) extends Value
-case class ConstantValue(constant: Int) extends Value
+trait Column {
+  val name: String
+}
+
+class TableColumn(val name: String) extends Column
 
 trait DataSource {
 }
 
 trait QueryNode {
-  def producedValues: Map[String, Value]
+  val producedValues: List[Value]
 
-  def apply(valueName: String): Value = producedValues(valueName)
+  def resolveValueByName(name: String): Option[Value] = producedValues.find {
+    case ColumnValue(col) => col.name == name
+    case AliasedValue(_, alias) => alias == name
+    case _ => false
+  }
+
+  def apply(valueName: String): Value = resolveValueByName(valueName).get
 
   def scan(dataSource: DataSource) = ScanNode(dataSource)
   def filter(constraintFunc: QueryNode => Constraint) = ConstraintNode(this, constraintFunc(this))
-  def map(mapFunc: QueryNode => Seq[Value]) = MapNode(this, mapFunc(this))
-  //def groupBy(groupFunc: QueryNode => Seq[Value]) = GroupNode(this, groupFunc(this))
-  def groupBy(groupFunc: QueryNode => Value) = GroupNode(this, Seq(groupFunc(this)))
+  def map(mapFunc: QueryNode => List[Value]) = MapNode(this, mapFunc(this))
+  def groupBy(groupFunc: QueryNode => List[Value]) = GroupNode(this, groupFunc(this))
 }
 
 trait SingleChildNode extends QueryNode {
   val childNode: QueryNode
-  def producedValues = childNode.producedValues
+  val producedValues = childNode.producedValues
 }
 
 case class ScanNode(source: DataSource) extends QueryNode {
-  def producedValues: Map[String, Value] = Map(
-    "foo" -> ColumnValue("foo"),
-    "bar" -> ColumnValue("bar")
-  )
+  val producedValues: List[Value] = (new TableColumn("foo") :: new TableColumn("bar") :: Nil).map(ColumnValue(_))
 }
 
 case class ConstraintNode(childNode: QueryNode, constraint: Constraint) extends SingleChildNode
@@ -48,9 +71,11 @@ case class MapNode(childNode: QueryNode, groupValues: Seq[Value]) extends Single
 
 object Main extends App {
   val query = ScanNode(new DataSource {})
-    .filter(_("foo") > ConstantValue(3))
-    .map(r => Seq(r("bar").sum as "sum"))
-    .groupBy(_("foo"))
+    .filter(row => row("foo") > 4)
+    .map(row => (row("bar").sum as "sum") :: Nil)
+    .groupBy(row => row("foo") :: Nil)
+    .filter(row => row("sum") > 10 and row("sum") < 20)
 
   println(query)
+  println(query.##)
 }
