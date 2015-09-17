@@ -20,17 +20,16 @@ sealed trait Value {
 
   def >(other: Value) = ComparisonConstraint(this, ConstraintType.GT, other)
   def <(other: Value) = ComparisonConstraint(this, ConstraintType.LT, other)
-  def sum = SumAggregation(this)
-  def count = CountAggregation(this)
   def as(theAlias: String): this.type = { alias = Some(theAlias); this }
   def asc: SortClause = SortClause(this, SortOrder.ASC)
   def desc: SortClause = SortClause(this, SortOrder.DESC)
-
-  def name: String = alias match {
-    case Some(a) => a
-    case None => toString
-  }
 }
+
+/** Represents a reference to a non-resolved, named value */
+case class NamedValue(name: String) extends Value
+
+/** A variable that comes from an external source */
+case class VariableValue(name: String) extends Value
 
 sealed trait AggregatedValue extends Value {
 }
@@ -44,74 +43,47 @@ case class AllValues() extends Value
 case class ConstantValue[T <: AnyVal](constant: T) extends Value
 object Implicits {
   implicit def constantToVal[T <: AnyVal](v: T): ConstantValue[T] = ConstantValue(v)
+  implicit def stringToNamedValue(name: String): Value = NamedValue(name)
+
   val * : Value = AllValues()
+  def SUM(value: Value) = SumAggregation(value)
+  def COUNT(value: Value) = SumAggregation(value)
 }
 import Implicits._
 
 case class Column(name: String)
 
 case class Table(name: String) {
-  def scan(columns: List[String]) = ScanNode(this, columns.map(name => ColumnValue(Column(name))))
+  def scan = ScanNode(this)
 }
 
 class ValueNotResolvedException(name: String) extends Exception(s"Value '$name' could not be resolved")
 class AmbiguousNameException(name: String) extends Exception(s"Value '$name' is ambiguous")
 
 trait QueryNode {
-  val producedValues: List[Value]
-
-  def resolveValueByName(name: String): Option[Value] = producedValues.find { v =>
-    if (v.name == name) true else v match {
-      case ColumnValue(c) => c.name == name
-      case _ => false
-    }
-  }
-
-  def apply(valueName: String): Value = resolveValueByName(valueName).getOrElse { throw new ValueNotResolvedException(valueName) }
-
-  //def scan(dataSource: DataSource) = ScanNode(dataSource)
-  def filter(constraintFunc: QueryNode => Constraint) = ConstraintNode(this, constraintFunc(this))
-  def aggregate(aggregatesFunc: QueryNode => List[AggregatedValue]) = AggregateNode(this, aggregatesFunc(this))
-  def groupBy(groupFunc: QueryNode => List[Value]) = GroupNode(this, groupFunc(this))
-  def orderBy(orderFunc: QueryNode => List[SortClause]) = SortNode(this, orderFunc(this))
-  def select(selectFunc: QueryNode => List[Value]) = SelectNode(this, selectFunc(this))
+  def filter(constraint: Constraint) = ConstraintNode(this, constraint)
+  def aggregate(aggregatedValues: List[AggregatedValue]) = AggregateNode(this, aggregatedValues)
+  def groupBy(groupValues: List[Value]) = GroupNode(this, groupValues)
+  def orderBy(clauses: List[SortClause]) = SortNode(this, clauses)
+  def select(values: List[Value]) = SelectNode(this, values)
   def project = select _
 }
 
 trait SingleChildNode extends QueryNode {
   val childNode: QueryNode
-  val producedValues: List[Value] = childNode.producedValues
 }
 
 trait JoinNode extends QueryNode {
   val leftNode: QueryNode
   val rightNode: QueryNode
-
-  val producedValues: List[Value] = leftNode.producedValues ++ rightNode.producedValues
-
-  override def resolveValueByName(name: String): Option[Value] = {
-    val leftValue = leftNode.resolveValueByName(name)
-    val rightValue = rightNode.resolveValueByName(name)
-
-    // If we have both a left and a right value, it means the name was ambiguous
-    if (leftValue.isDefined && rightValue.isDefined)
-      throw new AmbiguousNameException(name)
-    leftValue.orElse(rightValue)
-  }
 }
 
-case class ScanNode(table: Table, columns: List[ColumnValue]) extends QueryNode {
-  val producedValues: List[Value] = columns
-}
+case class ScanNode(table: Table) extends QueryNode
 
 case class ConstraintNode(childNode: QueryNode, constraint: Constraint) extends SingleChildNode
 case class GroupNode(childNode: QueryNode, groupValues: List[Value]) extends SingleChildNode
-case class AggregateNode(childNode: QueryNode, aggregatedValues: List[AggregatedValue]) extends SingleChildNode {
-  override val producedValues: List[Value] = childNode.producedValues ++ aggregatedValues
-}
-case class SelectNode(childNode: QueryNode, values: List[Value]) extends SingleChildNode {
-  override val producedValues: List[Value] = values
-}
+case class AggregateNode(childNode: QueryNode, aggregatedValues: List[AggregatedValue]) extends SingleChildNode
+case class SelectNode(childNode: QueryNode, values: List[Value]) extends SingleChildNode
 
 object SortOrder extends Enumeration {
   type SortOrder = Value
@@ -133,18 +105,18 @@ object Main extends App {
   // FROM table1
   // WHERE foo > 4
   // GROUP BY foo
-  // HAVING sum < 10 OR sum > 20
+  // HAVING sum < 10 OR sum > :var1
   // ORDER BY cnt DESC
 
   val table1 = new Table("table1")
 
-  val query = table1.scan(List("foo", "bar"))
-    .groupBy(row => List(row("foo")))
-    .aggregate(row => List(row("bar").sum as "sum", *.count as "cnt"))
-    .filter(row => row("sum") < 10 or row("sum") > 20)
-    .filter(row => row("foo") > 4)
-    .orderBy(row => List(row("cnt") desc))
-    .select(row => List(row("foo"), row("sum"), row("cnt")))
+  val query = table1.scan
+    .filter("foo" > ConstantValue(4))
+    .groupBy(List("foo"))
+    .aggregate(List(SUM("bar") as "sum", COUNT(*) as "cnt"))
+    .filter("sum" < ConstantValue(20) or "sum" > VariableValue("var1"))
+    .orderBy(List("cnt" desc))
+    .select(List("foo", "sum", "cnt"))
 
   println(query)
 }
