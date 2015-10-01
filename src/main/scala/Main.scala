@@ -3,13 +3,9 @@ import scala.reflect.ClassTag
 trait DataType
 
 trait Expression {
-  var alias: Option[String] = None
+  def as(alias: String): AliasedExpression = AliasedExpression(this, alias)
 
-  def as(name: String): this.type = { alias = Some(name); this }
-  def matchesName(name: String): Boolean = alias match {
-    case Some(a) => name == a
-    case None => false
-  }
+  def matchesName(name: String): Boolean = ???
 
   def >(other: Expression): ExpressionConstraint = ???
   def >=(other: Expression): ExpressionConstraint = ???
@@ -27,13 +23,13 @@ trait Expression {
   def desc: OrderClause = OrderClause(this, ascending=false)
 }
 
+case class AliasedExpression(expression: Expression, alias: String) extends Expression
+
 case class SumExpression(lhs: Expression, rhs: Expression) extends Expression
 
-case class ConstantExpression[T: ClassTag](constant: T) extends Expression {
-  protected def _matchesName(name: String): Boolean = false
-}
+case class ConstantExpression[T: ClassTag](constant: T) extends Expression
 
-class ExpressionList(val expressions: List[Expression]) extends Seq[Expression] {
+case class ExpressionList(expressions: List[Expression]) extends Seq[Expression] {
   def resolveExpression(expressionName: String): Option[Expression] = expressions.find(_.matchesName(expressionName))
   def apply(expressionName: String): Expression = resolveExpression(expressionName).get
 
@@ -44,7 +40,6 @@ class ExpressionList(val expressions: List[Expression]) extends Seq[Expression] 
 
 trait ExpressionConstraint {
   def or(other: ExpressionConstraint): ExpressionConstraint = ???
-  def and(other: ExpressionConstraint): ExpressionConstraint = ???
   def not: ExpressionConstraint = ???
 }
 
@@ -54,9 +49,9 @@ abstract class QueryNode {
   val producedExpressions: ExpressionList
 
   def filter(f: ExpressionList => ExpressionConstraint): QueryNode = FilterNode(this, f(producedExpressions))
-  def map(f: ExpressionList => Seq[Expression]): QueryNode = ???
-  def sortBy(f: ExpressionList => Seq[OrderClause]): QueryNode = ???
-  def groupBy(f: ExpressionList => Seq[Expression]): GroupNode = ???
+  def map(f: ExpressionList => List[Expression]): QueryNode = MapNode(this, f(this.producedExpressions))
+  def sortBy(f: ExpressionList => List[OrderClause]): QueryNode = SortNode(this, f(this.producedExpressions))
+  def groupBy(f: ExpressionList => List[Expression]): GroupNode = GroupNode(this, f(this.producedExpressions))
 }
 
 class SingleChildNode(val childNode: QueryNode) extends QueryNode {
@@ -64,19 +59,35 @@ class SingleChildNode(val childNode: QueryNode) extends QueryNode {
 }
 
 case class FilterNode(child: QueryNode, constraint: ExpressionConstraint) extends SingleChildNode(child)
+case class MapNode(child: QueryNode, expressions: List[Expression]) extends SingleChildNode(child) {
+  override val producedExpressions: ExpressionList = ExpressionList(expressions)
+}
 
-case class GroupNode(child: QueryNode, keys: ExpressionList) extends SingleChildNode(child) {
-  def reduceByKey(f: (ExpressionList, ExpressionList) => Seq[Expression]): QueryNode = ???
+case class SortNode(child: QueryNode, sortClauses: List[OrderClause]) extends SingleChildNode(child)
+
+case class GroupNode(child: QueryNode, keys: List[Expression]) extends SingleChildNode(child) {
+  def reduceByKey(f: (ExpressionList, ExpressionList) => List[Expression]): QueryNode = ReduceNode(this, f)
+}
+
+case class ReduceNode(child: QueryNode, expressionsFunction: (ExpressionList, ExpressionList) => List[Expression]) extends SingleChildNode(child) {
+  // TODO: Fix this
+  override val producedExpressions: ExpressionList = ExpressionList(expressionsFunction(child.producedExpressions, child.producedExpressions))
 }
 
 class Column(val table: Table, val name: String, val dataType: DataType)
 
 class Table {
-  def scan(columnNames: String*): QueryNode = ???
+  val columns: Array[Column] = Array()
+  def scan: QueryNode = ScanNode(this)
+}
+
+case class ColumnExpression(column: Column) extends Expression
+case class ScanNode(table: Table) extends QueryNode {
+  val producedExpressions: ExpressionList = ExpressionList(table.columns.map{ ColumnExpression(_) }.toList)
 }
 
 object Main extends App {
-  // SELECT foo, SUM(bar) AS sum, COUNT(*) AS cnt
+  // SELECT foo, SUM(bar) AS sum, COUNT(*) AS cnt, AVG(bar) AS avg
   // FROM table1
   // WHERE foo > 4
   // GROUP BY foo
@@ -97,7 +108,7 @@ object Main extends App {
    */
   val table1 = new Table
   table1
-    .scan("foo", "bar")
+    .scan
     .filter(row => row("foo") > ConstantExpression(4))
     .map(row => row :+ (ConstantExpression(1) as "one"))
     .groupBy(row => row("foo") :: Nil)
@@ -106,6 +117,7 @@ object Main extends App {
       (r1("one")+r2("one") as "cnt") ::
       Nil
     }
+    .map(row => row :+ ((row("sum")/row("cnt")) as "avg"))
     .filter(row => row("sum") < ConstantExpression(10) or row("sum") > ConstantExpression(20))
     .sortBy(_("cnt").desc :: Nil)
 }
